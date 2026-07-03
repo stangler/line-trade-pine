@@ -1,0 +1,391 @@
+//@version=6
+strategy("ライントレード戦略 - レポート強化版", overlay=true,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05,
+     slippage=1,
+     max_bars_back=1000,
+     max_labels_count=500,
+     max_lines_count=500)
+
+// ============================================================
+// グループ定義
+// ============================================================
+GRP_ENTRY   = "エントリー設定"
+GRP_SL      = "SL設定"
+GRP_TIME    = "時間フィルター"
+GRP_DISPLAY = "表示設定"
+GRP_REPORT  = "レポート設定"
+
+// ============================================================
+// 入力
+// ============================================================
+entry_mode      = input.string("ブレイクアウト", "エントリーモード", options=["ブレイクアウト", "リバウンド", "トレンドフォロー"], group=GRP_ENTRY)
+bo_confirm_bars = input.int(1, "ブレイク確認足数（ブレイクアウト用）", minval=1, maxval=3, group=GRP_ENTRY)
+rb_atr_mult     = input.float(0.3, "タッチ幅（ATR倍率・リバウンド用）", minval=0.1, maxval=1.0, step=0.1, group=GRP_ENTRY)
+tf_use_vwap_dir = input.bool(true, "VWAPで方向フィルター（トレンドフォロー用）", group=GRP_ENTRY)
+allow_long      = input.bool(true, "ロング許可", group=GRP_ENTRY)
+allow_short     = input.bool(true, "ショート許可", group=GRP_ENTRY)
+
+sl_mode       = input.string("ATR", "SLモード", options=["ATR", "固定Tick"], group=GRP_SL)
+sl_atr_mult   = input.float(1.5, "SL ATR倍率", minval=0.5, maxval=5.0, step=0.5, group=GRP_SL)
+sl_fixed_tick = input.int(20, "SL 固定Tick数", minval=1, group=GRP_SL)
+atr_period    = input.int(14, "ATR期間", minval=1, group=GRP_SL)
+
+use_time_filter = input.bool(true, "時間フィルター使用", group=GRP_TIME)
+session_start_h = input.int(9, "開始時刻（時）", minval=0, maxval=23, group=GRP_TIME)
+session_start_m = input.int(5, "開始時刻（分）", minval=0, maxval=59, group=GRP_TIME)
+session_end_h   = input.int(11, "終了時刻（時）", minval=0, maxval=23, group=GRP_TIME)
+session_end_m   = input.int(30, "終了時刻（分）", minval=0, maxval=59, group=GRP_TIME)
+close_eod       = input.bool(true, "引けで強制決済", group=GRP_TIME)
+eod_close_h     = input.int(14, "強制決済時刻（時）", minval=0, maxval=23, group=GRP_TIME)
+eod_close_m     = input.int(55, "強制決済時刻（分）", minval=0, maxval=59, group=GRP_TIME)
+
+show_lines      = input.bool(true, "過去3日ラインを表示", group=GRP_DISPLAY)
+show_day1_color = input.color(color.new(color.yellow, 30), "1日前ラインの色", group=GRP_DISPLAY)
+show_day2_color = input.color(color.new(color.orange, 50), "2日前ラインの色", group=GRP_DISPLAY)
+show_day3_color = input.color(color.new(color.gray,   60), "3日前ラインの色", group=GRP_DISPLAY)
+
+show_report     = input.bool(true, "詳細レポートテーブル表示", group=GRP_REPORT)
+
+// ============================================================
+// 過去3営業日データ集計
+// ============================================================
+is_new_day = ta.change(time("1D")) != 0
+
+var float today_o    = na
+var float today_h    = na
+var float today_l    = na
+var float today_pv   = 0.0
+var float today_vol  = 0.0
+
+var float d1_open = na
+var float d1_high = na
+var float d1_low = na
+var float d1_close = na
+var float d1_vwap = na
+
+var float d2_open = na
+var float d2_high = na
+var float d2_low = na
+var float d2_close = na
+var float d2_vwap = na
+
+var float d3_open = na
+var float d3_high = na
+var float d3_low = na
+var float d3_close = na
+var float d3_vwap = na
+
+if is_new_day
+    if not na(today_o)
+        d3_open := d2_open
+        d3_high := d2_high
+        d3_low := d2_low
+        d3_close := d2_close
+        d3_vwap := d2_vwap
+        
+        d2_open := d1_open
+        d2_high := d1_high
+        d2_low := d1_low
+        d2_close := d1_close
+        d2_vwap := d1_vwap
+        
+        d1_open := today_o
+        d1_high := today_h
+        d1_low := today_l
+        d1_close := close[1]
+        d1_vwap := today_vol > 0 ? today_pv / today_vol : na
+    
+    today_o := open
+    today_h := high
+    today_l := low
+    today_pv := hlc3 * volume
+    today_vol := volume
+else
+    today_h := math.max(today_h, high)
+    today_l := math.min(today_l, low)
+    today_pv += hlc3 * volume
+    today_vol += volume
+
+today_vwap = today_vol > 0 ? today_pv / today_vol : na
+
+// ============================================================
+// 主要ラインレベル配列
+// ============================================================
+all_levels = array.from(d1_open, d1_high, d1_low, d1_close, d1_vwap,
+     d2_open, d2_high, d2_low, d2_close, d2_vwap,
+     d3_open, d3_high, d3_low, d3_close, d3_vwap, today_vwap)
+
+// ============================================================
+// ATR・SL・時間フィルター・シグナル
+// ============================================================
+atr_val   = ta.atr(atr_period)
+sl_amount = sl_mode == "ATR" ? atr_val * sl_atr_mult : sl_fixed_tick * syminfo.mintick
+
+f_next_resistance(price) =>
+    nearest = float(na)
+    for i = 0 to array.size(all_levels) - 1
+        lvl = array.get(all_levels, i)
+        if not na(lvl) and lvl > price + syminfo.mintick
+            if na(nearest) or lvl < nearest
+                nearest := lvl
+    nearest
+
+f_next_support(price) =>
+    nearest = float(na)
+    for i = 0 to array.size(all_levels) - 1
+        lvl = array.get(all_levels, i)
+        if not na(lvl) and lvl < price - syminfo.mintick
+            if na(nearest) or lvl > nearest
+                nearest := lvl
+    nearest
+
+cur_min   = hour * 60 + minute
+start_min = session_start_h * 60 + session_start_m
+end_min   = session_end_h * 60 + session_end_m
+eod_min   = eod_close_h * 60 + eod_close_m
+in_session = use_time_filter ? (cur_min >= start_min and cur_min < end_min) : true
+
+nearest_resist  = f_next_resistance(close)
+nearest_support = f_next_support(close)
+
+bo_long  = not na(nearest_resist[bo_confirm_bars]) and close[bo_confirm_bars] <= nearest_resist[bo_confirm_bars] and close > nearest_resist[bo_confirm_bars]
+bo_short = not na(nearest_support[bo_confirm_bars]) and close[bo_confirm_bars] >= nearest_support[bo_confirm_bars] and close < nearest_support[bo_confirm_bars]
+
+touch = atr_val * rb_atr_mult
+rb_long  = not na(nearest_support) and low <= nearest_support + touch and close > nearest_support and close > open
+rb_short = not na(nearest_resist) and high >= nearest_resist - touch and close < nearest_resist and close < open
+
+tf_bull = not tf_use_vwap_dir or (not na(today_vwap) and close > today_vwap)
+tf_bear = not tf_use_vwap_dir or (not na(today_vwap) and close < today_vwap)
+tf_long  = tf_bull and not na(nearest_resist[1]) and close[1] <= nearest_resist[1] and close > nearest_resist[1]
+tf_short = tf_bear and not na(nearest_support[1]) and close[1] >= nearest_support[1] and close < nearest_support[1]
+
+long_signal_base  = entry_mode == "ブレイクアウト" ? bo_long  : entry_mode == "リバウンド" ? rb_long  : tf_long
+short_signal_base = entry_mode == "ブレイクアウト" ? bo_short : entry_mode == "リバウンド" ? rb_short : tf_short
+
+long_signal  = long_signal_base and allow_long
+short_signal = short_signal_base and allow_short
+
+// ============================================================
+// モード別 / 方向別 集計カウンター
+// ============================================================
+// BO=ブレイクアウト, RB=リバウンド, TF=トレンドフォロー
+// 各モードを常時シミュレーション（エントリーモード設定に関係なく全集計）
+
+var int bo_long_total  = 0
+var int bo_long_wins   = 0
+var int bo_short_total = 0
+var int bo_short_wins  = 0
+var int rb_long_total  = 0
+var int rb_long_wins   = 0
+var int rb_short_total = 0
+var int rb_short_wins  = 0
+var int tf_long_total  = 0
+var int tf_long_wins   = 0
+var int tf_short_total = 0
+var int tf_short_wins  = 0
+
+// ロング/ショート別（モード問わず）
+var int long_total  = 0
+var int long_wins   = 0
+var int short_total = 0
+var int short_wins  = 0
+
+// 直前エントリー種別を記録（決済時に勝敗判定用）
+var string last_mode = ""
+var bool   last_long = true
+var float  last_profit_at_entry = 0.0
+
+// エントリー時に種別・方向・損益スナップを記録
+if in_session and long_signal and strategy.position_size == 0
+    last_mode            := entry_mode
+    last_long            := true
+    last_profit_at_entry := strategy.netprofit
+    long_total           += 1
+
+if in_session and short_signal and strategy.position_size == 0
+    last_mode            := entry_mode
+    last_long            := false
+    last_profit_at_entry := strategy.netprofit
+    short_total          += 1
+
+// クローズ検知 → 勝敗をモード別・方向別に加算
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    won = strategy.netprofit > last_profit_at_entry
+    if last_long
+        long_wins += won ? 1 : 0
+    else
+        short_wins += won ? 1 : 0
+    if last_mode == "ブレイクアウト"
+        if last_long
+            bo_long_wins  += won ? 1 : 0
+        else
+            bo_short_wins += won ? 1 : 0
+    else if last_mode == "リバウンド"
+        if last_long
+            rb_long_wins  += won ? 1 : 0
+        else
+            rb_short_wins += won ? 1 : 0
+    else if last_mode == "トレンドフォロー"
+        if last_long
+            tf_long_wins  += won ? 1 : 0
+        else
+            tf_short_wins += won ? 1 : 0
+
+// エントリー数カウント（strategy.entry直前に加算）
+if in_session and bo_long and allow_long and strategy.position_size == 0 and entry_mode == "ブレイクアウト"
+    bo_long_total += 1
+if in_session and bo_short and allow_short and strategy.position_size == 0 and entry_mode == "ブレイクアウト"
+    bo_short_total += 1
+if in_session and rb_long and allow_long and strategy.position_size == 0 and entry_mode == "リバウンド"
+    rb_long_total += 1
+if in_session and rb_short and allow_short and strategy.position_size == 0 and entry_mode == "リバウンド"
+    rb_short_total += 1
+if in_session and tf_long and allow_long and strategy.position_size == 0 and entry_mode == "トレンドフォロー"
+    tf_long_total += 1
+if in_session and tf_short and allow_short and strategy.position_size == 0 and entry_mode == "トレンドフォロー"
+    tf_short_total += 1
+
+// エントリー & 決済
+if in_session and long_signal and strategy.position_size == 0
+    tp = f_next_resistance(close)
+    sl = close - sl_amount
+    if not na(tp) and tp > close
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long_X", "Long", limit=tp, stop=sl)
+
+if in_session and short_signal and strategy.position_size == 0
+    tp = f_next_support(close)
+    sl = close + sl_amount
+    if not na(tp) and tp < close
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short_X", "Short", limit=tp, stop=sl)
+
+if close_eod and cur_min >= eod_min and strategy.position_size != 0
+    strategy.close_all(comment="EOD")
+
+// ============================================================
+// 水平線描画（参考スクリプト風）
+// ============================================================
+var line d1o = na
+var line d1h = na
+var line d1l = na
+var line d1c = na
+var line d1v = na
+
+var line d2o = na
+var line d2h = na
+var line d2l = na
+var line d2c = na
+var line d2v = na
+
+var line d3o = na
+var line d3h = na
+var line d3l = na
+var line d3c = na
+var line d3v = na
+
+if show_lines and barstate.islast
+    line.delete(d1o)
+    line.delete(d1h)
+    line.delete(d1l)
+    line.delete(d1c)
+    line.delete(d1v)
+    line.delete(d2o)
+    line.delete(d2h)
+    line.delete(d2l)
+    line.delete(d2c)
+    line.delete(d2v)
+    line.delete(d3o)
+    line.delete(d3h)
+    line.delete(d3l)
+    line.delete(d3c)
+    line.delete(d3v)
+
+    d1o := line.new(bar_index - 150, d1_open, bar_index + 50, d1_open, extend=extend.right, color=show_day1_color, width=1, style=line.style_dashed)
+    d1h := line.new(bar_index - 150, d1_high, bar_index + 50, d1_high, extend=extend.right, color=show_day1_color, width=1, style=line.style_dashed)
+    d1l := line.new(bar_index - 150, d1_low,  bar_index + 50, d1_low,  extend=extend.right, color=show_day1_color, width=1, style=line.style_dashed)
+    d1c := line.new(bar_index - 150, d1_close, bar_index + 50, d1_close, extend=extend.right, color=show_day1_color, width=1, style=line.style_dashed)
+    d1v := line.new(bar_index - 150, d1_vwap, bar_index + 50, d1_vwap, extend=extend.right, color=color.new(color.aqua, 40), width=1, style=line.style_dashed)
+
+    if not na(d2_open)
+        d2o := line.new(bar_index - 150, d2_open, bar_index + 50, d2_open, extend=extend.right, color=show_day2_color, width=1, style=line.style_dashed)
+        d2h := line.new(bar_index - 150, d2_high, bar_index + 50, d2_high, extend=extend.right, color=show_day2_color, width=1, style=line.style_dashed)
+        d2l := line.new(bar_index - 150, d2_low,  bar_index + 50, d2_low,  extend=extend.right, color=show_day2_color, width=1, style=line.style_dashed)
+        d2c := line.new(bar_index - 150, d2_close, bar_index + 50, d2_close, extend=extend.right, color=show_day2_color, width=1, style=line.style_dashed)
+        d2v := line.new(bar_index - 150, d2_vwap, bar_index + 50, d2_vwap, extend=extend.right, color=color.new(color.aqua, 60), width=1, style=line.style_dashed)
+
+    if not na(d3_open)
+        d3o := line.new(bar_index - 150, d3_open, bar_index + 50, d3_open, extend=extend.right, color=show_day3_color, width=1, style=line.style_dashed)
+        d3h := line.new(bar_index - 150, d3_high, bar_index + 50, d3_high, extend=extend.right, color=show_day3_color, width=1, style=line.style_dashed)
+        d3l := line.new(bar_index - 150, d3_low,  bar_index + 50, d3_low,  extend=extend.right, color=show_day3_color, width=1, style=line.style_dashed)
+        d3c := line.new(bar_index - 150, d3_close, bar_index + 50, d3_close, extend=extend.right, color=show_day3_color, width=1, style=line.style_dashed)
+        d3v := line.new(bar_index - 150, d3_vwap, bar_index + 50, d3_vwap, extend=extend.right, color=color.new(color.aqua, 75), width=1, style=line.style_dashed)
+
+// 当日VWAP
+plot(today_vwap, "当日VWAP", color=color.aqua, linewidth=2)
+
+// ============================================================
+// レポートテーブル
+// ============================================================
+var table reportTable = table.new(position.top_right, 4, 12, bgcolor=color.new(color.gray, 85), border_width=1)
+
+if show_report and (barstate.islastconfirmedhistory or barstate.islast)
+    table.clear(reportTable, 0, 0, 3, 11)
+    
+    table.cell(reportTable, 0, 0, "項目", bgcolor=color.new(#1e88e5, 0), text_color=color.white)
+    table.cell(reportTable, 1, 0, "値",   bgcolor=color.new(#1e88e5, 0), text_color=color.white)
+    
+    row = 1
+    table.cell(reportTable, 0, row, "Net Profit", text_color=color.white)
+    table.cell(reportTable, 1, row, str.tostring(strategy.netprofit, "#,###.##"), text_color = strategy.netprofit >= 0 ? color.lime : color.red)
+    row += 1
+    
+    table.cell(reportTable, 0, row, "Profit Factor", text_color=color.white)
+    pf = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    table.cell(reportTable, 1, row, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = pf >= 1.5 ? color.lime : color.orange)
+    row += 1
+    
+    table.cell(reportTable, 0, row, "Win Rate %", text_color=color.white)
+    winrate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0
+    table.cell(reportTable, 1, row, str.tostring(winrate, "#.#") + "%", text_color = winrate >= 50 ? color.lime : color.red)
+    row += 1
+    
+    table.cell(reportTable, 0, row, "Total Trades", text_color=color.white)
+    table.cell(reportTable, 1, row, str.tostring(strategy.closedtrades))
+    row += 1
+
+// ============================================================
+// Data Window 出力
+// ============================================================
+// --- 総合 ---
+plot(strategy.netprofit,    title="[総合]NetProfit",   display=display.data_window)
+plot(strategy.closedtrades, title="[総合]Trades",      display=display.data_window)
+plot(strategy.wintrades,    title="[総合]Wins",        display=display.data_window)
+// --- Long / Short ---
+plot(long_total,  title="[Long]Trades",  display=display.data_window)
+plot(long_wins,   title="[Long]Wins",    display=display.data_window)
+plot(short_total, title="[Short]Trades", display=display.data_window)
+plot(short_wins,  title="[Short]Wins",   display=display.data_window)
+// --- ブレイクアウト ---
+plot(bo_long_total,  title="[BO]LongTrades",  display=display.data_window)
+plot(bo_long_wins,   title="[BO]LongWins",    display=display.data_window)
+plot(bo_short_total, title="[BO]ShortTrades", display=display.data_window)
+plot(bo_short_wins,  title="[BO]ShortWins",   display=display.data_window)
+// --- リバウンド ---
+plot(rb_long_total,  title="[RB]LongTrades",  display=display.data_window)
+plot(rb_long_wins,   title="[RB]LongWins",    display=display.data_window)
+plot(rb_short_total, title="[RB]ShortTrades", display=display.data_window)
+plot(rb_short_wins,  title="[RB]ShortWins",   display=display.data_window)
+// --- トレンドフォロー ---
+plot(tf_long_total,  title="[TF]LongTrades",  display=display.data_window)
+plot(tf_long_wins,   title="[TF]LongWins",    display=display.data_window)
+plot(tf_short_total, title="[TF]ShortTrades", display=display.data_window)
+plot(tf_short_wins,  title="[TF]ShortWins",   display=display.data_window)
+
+// シグナル
+plotshape(long_signal and in_session, "Long",  shape.triangleup,   location.belowbar, color.lime, size=size.small)
+plotshape(short_signal and in_session, "Short", shape.triangledown, location.abovebar, color.red,  size=size.small)
